@@ -121,5 +121,5 @@ with torch.no_grad():
         print(f"Accuracy of {classes[i]}: {acc}%")
 
 
-scaled_model = ModelWithTemperature(model).to(device)
-scaled_model.set_temperature(test_loader)
+#scaled_model = ModelWithTemperature(model).to(device)
+#scaled_model.set_temperature(test_loader)

@@ -1,10 +1,13 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.optim import lr_scheduler
 import torchvision as tv
 import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
 import numpy as np
+import time
+import copy
 from temperature_scaling import ModelWithTemperature
 from ReliabilityDiagram import _calculate_ece, make_model_diagrams
 
@@ -14,27 +17,120 @@ from ReliabilityDiagram import _calculate_ece, make_model_diagrams
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Hyperparameters
-num_epochs = 3
 batch_size = 4
 learning_rate = 0.01
 
 # Transform
-transform = transforms.Compose( [transforms.ToTensor(), 
-                                 transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+data_transforms = {
+    'train': transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))
+    ]),
+    'test': transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))
+    ]),
+}
 
 # Dataset
 train_dataset = tv.datasets.CIFAR10(root="C:\Python39\Datasets", train=True,
-                                    download=True, transform=transform)
+                                    download=True, transform=data_transforms['train'])
+
+train_data, val_data = torch.utils.data.random_split(train_dataset, [46000, 4000])
+
 
 test_dataset = tv.datasets.CIFAR10(root="C:\Python39\Datasets", train=False,
-                                    download=True, transform=transform)
+                                    download=True, transform=data_transforms['test'])
 
-train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+train_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True)
+
+val_loader = torch.utils.data.DataLoader(val_data, batch_size=batch_size, shuffle=True)
 
 test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
+dataloaders = {
+    'train': train_loader,
+    'val': val_loader
+}
+
+dataset_sizes = {
+    'train': batch_size*len(train_loader),
+    'val': batch_size*len(val_loader)
+}
+
 classes = ("plane", "car", "bird", "cat", "deer", "dog", "frog",
            "horse", "ship", "truck")
+
+
+
+def train_model(model, criterion, optimizer, scheduler, num_epochs=25):
+    since = time.time()
+
+    best_model_wts = copy.deepcopy(model.state_dict())
+    best_acc = 0.0
+
+    for epoch in range(num_epochs):
+        print('Epoch {}/{}'.format(epoch, num_epochs - 1))
+        print('-' * 20)
+
+        # Each epoch has a training and validation phase
+        for phase in ['train', 'val']:
+            if phase == 'train':
+                model.train()  # Set model to training mode
+            else:
+                model.eval()   # Set model to evaluate mode
+
+            running_loss = 0.0
+            running_corrects = 0
+
+            # Iterate over data.
+            for inputs, labels in dataloaders[phase]:
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+
+                # forward
+                # track history if only in train
+                with torch.set_grad_enabled(phase == 'train'):
+                    outputs = model(inputs)
+                    _, preds = torch.max(outputs, 1)
+                    loss = criterion(outputs, labels)
+
+                    # backward + optimize only if in training phase
+                    if phase == 'train':
+                        optimizer.zero_grad()
+                        loss.backward()
+                        optimizer.step()
+                
+                # statistics
+                running_loss += loss.item() * inputs.size(0)
+                running_corrects += torch.sum(preds == labels.data)
+
+            if phase == 'train':
+                scheduler.step()
+
+            epoch_loss = running_loss / dataset_sizes[phase]
+            epoch_acc = running_corrects.double() / dataset_sizes[phase]
+
+            print('{} Loss: {:.4f} Acc: {:.4f}'.format(
+                phase, epoch_loss, epoch_acc))
+
+            # deep copy the model
+            if phase == 'val' and epoch_acc > best_acc:
+                best_acc = epoch_acc
+                best_model_wts = copy.deepcopy(model.state_dict())
+
+        print()
+
+    time_elapsed = time.time() - since
+    print('Training complete in {:.0f}m {:.0f}s'.format(
+        time_elapsed // 60, time_elapsed % 60))
+    print('Best val Acc: {:4f}\n\n'.format(best_acc))
+
+    # load best model weights
+    model.load_state_dict(best_model_wts)
+    return model
+
 
 
 # CNN Model
@@ -61,38 +157,28 @@ class CNN(nn.Module):
         return out
     
 
+# Own model to test
 model = CNN().to(device)
 
 # Loss and optimization
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
 
-# Training Loop
-n_total_epochs = len(train_loader)
+# StepLR Decays the learning rate of each parameter group by gamma every step_size epochs
+# Decay LR by a factor of 0.1 every 10 epochs
+# Learning rate scheduling should be applied after optimizer’s update
 
-for epoch in range(num_epochs):
-    for i, (images, labels) in enumerate(train_loader):
-        # origin shape: [4, 3, 32, 32] -> [4, 3, 1024]
-        # input layer: 3 input channels, 6 output channels, 5 kernel size
-        images = images.to(device)
-        labels = labels.to(device)
-        
-        # Forward Pass
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        
-        # Backwards
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        
-        if(i+1) % 2000 == 0:
-            print(f"Epoch [{epoch + 1}/{num_epochs}], Step [{i+1}/{n_total_epochs}], Loss: {loss.item():.4f}")
-        
+step_lr_scheduler = lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
 
-print("Finished Training")
+model = train_model(model, criterion, optimizer, step_lr_scheduler, num_epochs=30)
 
 
+# Source: https://github.com/chenyaofo/pytorch-cifar-models
+#model = torch.hub.load("chenyaofo/pytorch-cifar-models", "cifar10_vgg16_bn", pretrained=True).to(device)
+#model = torch.hub.load("chenyaofo/pytorch-cifar-models", "cifar10_resnet56", pretrained=True).to(device)
+model.eval()
+
+# Testing
 outs = torch.Tensor()
 trues_list = []
 
@@ -136,8 +222,7 @@ with torch.no_grad():
 # Reliability Diagram
 outs = outs.view(-1, 10)
 trues = torch.Tensor(trues_list)
-make_model_diagrams(outs, trues, 15)
-
+make_model_diagrams(outs, trues, 10)
 
 
 
@@ -191,7 +276,5 @@ with torch.no_grad():
 # Reliability Diagram
 outs = outs.view(-1, 10)
 trues = torch.Tensor(trues_list)
-make_model_diagrams(outs, trues, 15)
-
-
+make_model_diagrams(outs, trues, 10)
 

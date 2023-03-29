@@ -8,6 +8,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import time
 import copy
+from pytorch_ood.dataset.img import Textures
+from pytorch_ood.detector import EnergyBased, ODIN
+from pytorch_ood.utils import OODMetrics, ToUnknown
 from temperature_scaling import ModelWithTemperature
 from ReliabilityDiagram import _calculate_ece, make_model_diagrams
 
@@ -23,11 +26,12 @@ learning_rate = 0.01
 # Transform
 data_transforms = {
     'train': transforms.Compose([
-        transforms.RandomHorizontalFlip(),
+        transforms.Resize(size=(32, 32)),
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))
     ]),
     'test': transforms.Compose([
+        transforms.Resize(size=(32, 32)),
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))
     ]),
@@ -40,14 +44,22 @@ train_dataset = tv.datasets.CIFAR10(root="C:\Python39\Datasets", train=True,
 train_data, val_data = torch.utils.data.random_split(train_dataset, [46000, 4000])
 
 
-test_dataset = tv.datasets.CIFAR10(root="C:\Python39\Datasets", train=False,
+ID_test_dataset = tv.datasets.CIFAR10(root="C:\Python39\Datasets", train=False,
                                     download=True, transform=data_transforms['test'])
 
 train_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True)
 
 val_loader = torch.utils.data.DataLoader(val_data, batch_size=batch_size, shuffle=True)
 
-test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+ID_test_loader = torch.utils.data.DataLoader(ID_test_dataset, batch_size=batch_size, shuffle=False)
+
+
+OOD_test_dataset = Textures(root="data", download=True, transform=data_transforms['test'], target_transform=ToUnknown())
+
+OOD_test_loader = torch.utils.data.DataLoader(OOD_test_dataset, batch_size=batch_size, shuffle=False)
+
+mixed_test_loader = torch.utils.data.DataLoader(OOD_test_dataset + ID_test_dataset, batch_size=batch_size, shuffle=False)
+
 
 dataloaders = {
     'train': train_loader,
@@ -146,10 +158,13 @@ class CNN(nn.Module):
         self.fc1 = nn.Linear(16*5*5, 120)
         self.fc2 = nn.Linear(120, 64)
         self.fc3 = nn.Linear(64, 10)
+        self.dropout = nn.Dropout(0.2)
     
     def forward(self, x):
         out = self.pool1(F.relu(self.bat1(self.conv1(x))))
+        out = self.dropout(out)
         out = self.pool2(F.relu(self.bat2(self.conv2(out))))
+        out = self.dropout(out)
         out = out.view(-1, 16*5*5)
         out = F.relu(self.fc1(out))
         out = F.relu(self.fc2(out))
@@ -158,7 +173,11 @@ class CNN(nn.Module):
     
 
 # Own model to test
+
 model = CNN().to(device)
+# Source: https://github.com/chenyaofo/pytorch-cifar-models
+#model = torch.hub.load("chenyaofo/pytorch-cifar-models", "cifar10_vgg16_bn", pretrained=True).to(device)
+#model = torch.hub.load("chenyaofo/pytorch-cifar-models", "cifar10_resnet56", pretrained=True).to(device)
 
 # Loss and optimization
 criterion = nn.CrossEntropyLoss()
@@ -170,12 +189,7 @@ optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
 
 step_lr_scheduler = lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
 
-model = train_model(model, criterion, optimizer, step_lr_scheduler, num_epochs=50)
-
-
-# Source: https://github.com/chenyaofo/pytorch-cifar-models
-#model = torch.hub.load("chenyaofo/pytorch-cifar-models", "cifar10_vgg16_bn", pretrained=True).to(device)
-#model = torch.hub.load("chenyaofo/pytorch-cifar-models", "cifar10_resnet56", pretrained=True).to(device)
+model = train_model(model, criterion, optimizer, step_lr_scheduler, num_epochs=45)
 model.eval()
 
 # Testing
@@ -188,7 +202,7 @@ with torch.no_grad():
     n_class_correct = [0 for i in range(10)]
     n_class_samples = [0 for i in range(10)]
     
-    for images, labels in test_loader:
+    for images, labels in ID_test_loader:
         images = images.to(device)
         labels = labels.to(device)
         outputs = model(images)
@@ -212,69 +226,77 @@ with torch.no_grad():
             
             
     acc = 100.0 * n_correct / n_samples
-    print(f"Before Accuracy of CNN: {acc}%")
+    print(f"ID Accuracy of CNN: {acc}%")
         
     for i in range(10):
         acc = 100.0 * n_class_correct[i] / n_class_samples[i]
         print(f"Accuracy of {classes[i]}: {acc}%")
 
 
-# Reliability Diagram
-outs = outs.view(-1, 10)
-trues = torch.Tensor(trues_list)
-make_model_diagrams(outs, trues, 10)
 
-
-
-
-
-# Temperature Scalling
-print("\n\n\n")
-scaled_model = ModelWithTemperature(model).to(device)
-scaled_model.set_temperature(test_loader)
-
-outs = torch.Tensor()
-trues_list = []
-
+# Using OOD data
 with torch.no_grad():
     n_correct = 0
     n_samples = 0
     n_class_correct = [0 for i in range(10)]
     n_class_samples = [0 for i in range(10)]
     
-    for images, labels in test_loader:
+    for images, labels in OOD_test_loader:
         images = images.to(device)
         labels = labels.to(device)
-        outputs = scaled_model(images)
+        outputs = model(images)
             
         # Max returns (value, index)
         _, predicted = torch.max(outputs, 1)
         n_samples += labels.size(0)
-        n_correct += (predicted == labels).sum().item()
-        
-        for i in range(batch_size):
-            label = labels[i]
-            pred = predicted[i]
-            
-            outs = torch.cat((outs, outputs[i]), 0)
-            trues_list.append(label.item())
-            
-            if(label == pred):
-                n_class_correct[label] += 1
-            
-            n_class_samples[label] += 1
-            
+        n_correct += (predicted == labels).sum().item()          
             
     acc = 100.0 * n_correct / n_samples
-    print(f"\nAfter Accuracy of CNN: {acc}%")
-        
-    for i in range(10):
-        acc = 100.0 * n_class_correct[i] / n_class_samples[i]
-        print(f"Accuracy of {classes[i]}: {acc}%")
+    print(f"\nOOD Accuracy of CNN: {acc}%")
+    
+    
+    
+
+
+# Using mixed data
+with torch.no_grad():
+    n_correct = 0
+    n_samples = 0
+    n_class_correct = [0 for i in range(10)]
+    n_class_samples = [0 for i in range(10)]
+    
+    for images, labels in mixed_test_loader:
+        images = images.to(device)
+        labels = labels.to(device)
+        outputs = model(images)
+            
+        # Max returns (value, index)
+        _, predicted = torch.max(outputs, 1)
+        n_samples += labels.size(0)
+        n_correct += (predicted == labels).sum().item()          
+            
+    acc = 100.0 * n_correct / n_samples
+    print(f"\Mixed Accuracy of CNN: {acc}%")
+
+
+
+
+
+
+detector = EnergyBased(model)
+
+metrics = OODMetrics()
+
+for x, y in mixed_test_loader:
+    metrics.update(detector(x.to(device)), y)
+
+print(metrics.compute())
 
 
 # Reliability Diagram
 outs = outs.view(-1, 10)
 trues = torch.Tensor(trues_list)
 make_model_diagrams(outs, trues, 10)
+
+
 
